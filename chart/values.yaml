@@ -1,0 +1,6 @@
+image:
+  repository: migration.local
+  tag: dev
+crds:
+  enabled: true
+  experimental: false

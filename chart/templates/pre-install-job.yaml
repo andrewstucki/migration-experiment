@@ -1,0 +1,34 @@
+{{- if .Values.crds.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-crds
+  annotations:
+    "helm.sh/hook":               "pre-install,pre-upgrade"
+    "helm.sh/hook-delete-policy": "before-hook-creation,hook-succeeded,hook-failed"
+    "helm.sh/hook-weight":        "-5"
+spec:
+  template:
+    metadata:
+    spec:
+      serviceAccountName: {{ .Release.Name }}-crds
+      restartPolicy: OnFailure
+      containers:
+        - name: crd-installation
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/migration-operator"]
+          args:
+            - crds
+            {{- if .Values.crds.experimental }}
+            - --experimental
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+{{- end }}

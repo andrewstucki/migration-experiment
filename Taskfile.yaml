@@ -1,0 +1,48 @@
+version: '3'
+
+run: once
+
+shopt: [globstar]
+
+vars:
+  SRC_DIR:
+    sh: 'realpath {{default "." .SRC_DIR}}'
+
+tasks:
+  generate:
+    cmds:
+      - |
+        controller-gen \
+          paths='./...' \
+          object \
+          crd \
+          rbac:roleName=operator \
+          output:rbac:artifacts:config=chart/templates \
+          output:crd:artifacts:config=crds
+      - |
+        register-gen \
+          --output-file zz_generated.register.go \
+          ./apis/...
+      - "sed -i '' 's/name: operator/name: {{ `{{` }} .Release.Namespace {{ `}}` }}:{{ `{{` }} .Release.Name {{ `}}` }}/g' chart/templates/role.yaml"
+      - mv chart/templates/role.yaml chart/templates/clusterrole.yaml
+
+  build:
+    cmds:
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o migration-operator
+      - docker build . --tag migration.local:dev
+
+  cluster:
+    cmds:
+      - k3d cluster delete migration || true
+      - k3d cluster create migration --image rancher/k3s:v1.27.4-k3s1 --port "8080:80@loadbalancer" --port "8443:443@loadbalancer"
+
+  dev:
+    cmds:
+      - helm uninstall migration --namespace migration || true
+      - k3d image import migration.local:dev --cluster migration
+      - helm install migration --namespace migration --create-namespace --set=unbindAfter=10s ./chart
+
+  install-tools:
+    cmds:
+      - go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.0
+      - go install k8s.io/code-generator/cmd/register-gen@285401e6db04dead462fbc9860ade09fac2c58e7
