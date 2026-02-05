@@ -5,11 +5,9 @@ import (
 
 	"github.com/redpanda-data/common-go/kube"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	migrationv1alpha1 "github.com/andrewstucki/migration-experiment/apis/migration/v1alpha1"
 	"github.com/andrewstucki/migration-experiment/render"
@@ -88,21 +86,7 @@ func SetupOldReconciler(operator migrationv1alpha1.Image, mgr ctrl.Manager) erro
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&migrationv1alpha1.Old{})
 
-	for _, o := range render.OldRenderedTypes() {
-		builder.Watches(o, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			name, ok := obj.GetLabels()[render.OldNameLabelKey]
-			if !ok {
-				return nil
-			}
-			namespace, ok := obj.GetLabels()[render.OldNamespaceLabelKey]
-			if !ok {
-				return nil
-			}
-			return []ctrl.Request{{
-				NamespacedName: types.NamespacedName{Namespace: namespace, Name: name},
-			}}
-		}))
-	}
+	maybeWatchResources(ctl.Scheme(), ctl.RESTMapper(), builder, render.OldRenderedTypes(), render.OldNameLabelKey, render.OldNamespaceLabelKey)
 
 	return builder.Complete(&OldReconciler{operator: operator, ctl: ctl, syncerFactory: render.OldSyncerFactoryForKubeCtl(ctl)})
 }
