@@ -21,7 +21,7 @@ type Old struct {
 }
 
 type OldSpec struct {
-	// Add fields here
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 type OldStatus struct {
@@ -48,7 +48,7 @@ type New struct {
 }
 
 type NewSpec struct {
-	// Add fields here
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 type NewStatus struct {
