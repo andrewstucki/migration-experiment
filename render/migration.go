@@ -19,7 +19,10 @@ import (
 
 // TODO: extract to kube package
 
-var ErrUnmatchedMigrationTarget = errors.New("migration target and source both require migration labels")
+var (
+	ErrMigrationSourceNotFound  = errors.New("migration source not found")
+	ErrUnmatchedMigrationTarget = errors.New("migration target and source both require migration labels")
+)
 
 func ptrFor[T any, PT PObject[T]]() PT {
 	var v T
@@ -81,22 +84,22 @@ func (m *statefulMigrator[T, U, PT, PU]) EnsureMigrated(ctx context.Context, tar
 		return nil, err
 	}
 
-	// if we can't find a source, we'll assume that we don't need to migrate
+	// if we can't find a source either error or no-op depending on whether or not this target should be migrated
 	if source == nil {
+		if m.ShouldMigrateTarget(target) {
+			return nil, ErrMigrationSourceNotFound
+		}
 		return nil, nil
 	}
 
+	// at this point we know we have a source, so check to make sure we're supposed to be migrating it
 	if !m.ShouldMigrateSource(source) {
 		return nil, ErrUnmatchedMigrationTarget
 	}
 
-	// we only want to operate on sources that are marked as migrating
-	if !m.migrator.IsMigrating(source) {
-		// if the source is already marked as migrated, we can skip everything else
-		if m.migrator.IsMigrated(source) {
-			return source, nil
-		}
-		return nil, nil
+	// if the source is already marked as migrated, we can skip everything else
+	if m.migrator.IsMigrated(source) {
+		return source, nil
 	}
 
 	targetSyncer := m.targetSyncerFactory.Syncer(target)
