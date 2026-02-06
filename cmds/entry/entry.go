@@ -1,8 +1,9 @@
 package entry
 
 import (
-	"context"
 	"os"
+
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/andrewstucki/migration-experiment/log"
 	"github.com/spf13/cobra"
@@ -13,9 +14,7 @@ func Command() *cobra.Command {
 		Use:   "entry",
 		Short: "Entrypoint",
 		Run: func(cmd *cobra.Command, args []string) {
-			ctx := cmd.Context()
-
-			if err := run(ctx); err != nil {
+			if err := run(); err != nil {
 				log.Error(err, "failed to run")
 				os.Exit(1)
 			}
@@ -25,8 +24,8 @@ func Command() *cobra.Command {
 	return cmd
 }
 
-func run(ctx context.Context) error {
-	<-ctx.Done()
+func run() error {
+	<-ctrl.SetupSignalHandler().Done()
 
 	return nil
 }

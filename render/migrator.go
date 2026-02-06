@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	oldToNewMigrationLabelStatus = "migration.lambda.coffee/new-to-old-migration/status"
-	oldToNewMigrationLabelSource = "migration.lambda.coffee/new-to-old-migration/source"
+	oldToNewMigrationLabelStatus = "migration.lambda.coffee/new-to-old-migration-status"
+	oldToNewMigrationLabelSource = "migration.lambda.coffee/new-to-old-migration-source"
 )
 
 type OldToNewMigrator struct {

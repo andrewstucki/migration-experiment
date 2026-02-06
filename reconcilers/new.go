@@ -41,10 +41,22 @@ func (r *NewReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	syncer := r.syncerFactory.Syncer(object)
 
+	var sets appsv1.StatefulSetList
+	err = r.ctl.List(ctx, object.GetNamespace(), &sets, client.MatchingLabels(render.NewOwnershipLabels(object)))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if object.GetDeletionTimestamp() != nil {
 		if controllerutil.RemoveFinalizer(object, Finalizer) {
 			if _, err := syncer.DeleteAll(ctx); err != nil {
 				return ctrl.Result{}, err
+			}
+
+			for _, set := range sets.Items {
+				if err := r.ctl.Delete(ctx, &set); err != nil {
+					return ctrl.Result{}, err
+				}
 			}
 
 			if err := r.ctl.Update(ctx, object); err != nil {
@@ -76,7 +88,7 @@ func (r *NewReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	var sets appsv1.StatefulSetList
+	// re-fetch the sets since we may have migrated some
 	err = r.ctl.List(ctx, object.GetNamespace(), &sets, client.MatchingLabels(render.NewOwnershipLabels(object)))
 	if err != nil {
 		return ctrl.Result{}, err
@@ -88,7 +100,11 @@ func (r *NewReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if outdated != nil {
+		stable, err := r.manager.PodsStable(ctx, &set)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if outdated != nil && stable {
 			logger.Info("found outdated pod, rolling", "pod", outdated.Name)
 			if err := r.ctl.Delete(ctx, outdated); err != nil {
 				return ctrl.Result{}, err
@@ -98,6 +114,9 @@ func (r *NewReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	desired := render.NewStatefulSet(r.operator, object)
+	if err := controllerutil.SetControllerReference(object, desired, r.ctl.Scheme()); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.ctl.Apply(ctx, desired, client.ForceOwnership); err != nil {
 		return ctrl.Result{}, err
 	}

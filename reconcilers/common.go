@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,6 +62,26 @@ func NewPodManager(ctl *kube.Ctl) *PodManager {
 	return &PodManager{ctl: ctl}
 }
 
+func (m *PodManager) PodsStable(ctx context.Context, set *appsv1.StatefulSet) (bool, error) {
+	pods, err := m.getPods(ctx, set)
+	if err != nil {
+		return false, err
+	}
+
+	// make sure none are in the process of terminating
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.GetDeletionTimestamp() != nil {
+			return false, nil
+		}
+	}
+
+	desiredReplicas := ptr.Deref(set.Spec.Replicas, 1)
+	actualReplicas := int32(len(pods.Items))
+
+	return set.Status.ObservedGeneration == set.Generation && desiredReplicas == set.Status.ReadyReplicas && desiredReplicas == actualReplicas, nil
+}
+
 func (m *PodManager) GetNextOutdatedPod(ctx context.Context, set *appsv1.StatefulSet) (*corev1.Pod, error) {
 	revisions, err := m.GetStatefulSetRevisions(ctx, set)
 	if err != nil {
@@ -70,16 +91,9 @@ func (m *PodManager) GetNextOutdatedPod(ctx context.Context, set *appsv1.Statefu
 		return nil, nil
 	}
 
-	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	pods, err := m.getPods(ctx, set)
 	if err != nil {
-		return nil, fmt.Errorf("constructing label selector: %w", err)
-	}
-
-	pods, err := kube.List[corev1.PodList](ctx, m.ctl, set.GetNamespace(), client.MatchingLabelsSelector{
-		Selector: selector,
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "listing Pods for StatefulSet %s/%s", set.GetNamespace(), set.GetName())
+		return nil, err
 	}
 
 	for i := range pods.Items {
@@ -91,6 +105,21 @@ func (m *PodManager) GetNextOutdatedPod(ctx context.Context, set *appsv1.Statefu
 	}
 
 	return nil, nil
+}
+
+func (m *PodManager) getPods(ctx context.Context, set *appsv1.StatefulSet) (*corev1.PodList, error) {
+	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("constructing label selector: %w", err)
+	}
+
+	pods, err := kube.List[corev1.PodList](ctx, m.ctl, set.GetNamespace(), client.MatchingLabelsSelector{
+		Selector: selector,
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "listing Pods for StatefulSet %s/%s", set.GetNamespace(), set.GetName())
+	}
+	return pods, nil
 }
 
 func (m *PodManager) GetStatefulSetRevisions(ctx context.Context, set *appsv1.StatefulSet) ([]*appsv1.ControllerRevision, error) {

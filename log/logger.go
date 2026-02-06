@@ -42,4 +42,5 @@ func init() {
 	}
 	Logger = zapr.NewLogger(zaplogger)
 	ctrl.SetLogger(Logger)
+	kube.SetDebounceErrorFunc(DebounceError)
 }

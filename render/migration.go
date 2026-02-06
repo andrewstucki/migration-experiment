@@ -2,6 +2,7 @@ package render
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 )
 
 // TODO: extract to kube package
+
+var ErrUnmatchedMigrationTarget = errors.New("migration target and source both require migration labels")
 
 func ptrFor[T any, PT PObject[T]]() PT {
 	var v T
@@ -83,6 +86,10 @@ func (m *statefulMigrator[T, U, PT, PU]) EnsureMigrated(ctx context.Context, tar
 		return nil, nil
 	}
 
+	if !m.ShouldMigrateSource(source) {
+		return nil, ErrUnmatchedMigrationTarget
+	}
+
 	// we only want to operate on sources that are marked as migrating
 	if !m.migrator.IsMigrating(source) {
 		// if the source is already marked as migrated, we can skip everything else
@@ -121,10 +128,22 @@ func (m *statefulMigrator[T, U, PT, PU]) EnsureMigrated(ctx context.Context, tar
 				return nil, err
 			}
 		}
-		// mark the source as migrated
-		m.migrator.MarkMigrated(source)
-		// and apply to ensure we've persisted the migration marker
-		if err := m.ctl.Apply(ctx, source); err != nil {
+
+		if err := retry.RetryOnConflict(wait.Backoff{
+			Duration: 10 * time.Millisecond,
+			Factor:   1.5,
+			Jitter:   0.1,
+			Steps:    3,
+		}, func() error {
+			if err := m.ctl.Get(ctx, client.ObjectKeyFromObject(source), source); err != nil {
+				return err
+			}
+
+			// mark the source as migrated
+			m.migrator.MarkMigrated(source)
+			// and update to ensure we've persisted the migration marker
+			return m.ctl.Update(ctx, source)
+		}); err != nil {
 			return nil, err
 		}
 	}

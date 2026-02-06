@@ -38,14 +38,20 @@ func NewRenderedTypes() []kube.Object {
 
 func NewStatefulSet(image migrationv1alpha1.Image, state *migrationv1alpha1.New) *appsv1.StatefulSet {
 	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "set",
+			Namespace: state.GetNamespace(),
+			Labels:    NewOwnershipLabels(state),
+		},
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
-				MatchLabels: NewOwnershipLabels(state),
+				// this also needs to be identical to the old selector
+				MatchLabels: statefulsetSelectorLabels("set"),
 			},
 			Replicas: state.Spec.Replicas,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: NewOwnershipLabels(state),
+					Labels: mergeLabels(NewOwnershipLabels(state), statefulsetSelectorLabels("set")),
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -54,16 +60,20 @@ func NewStatefulSet(image migrationv1alpha1.Image, state *migrationv1alpha1.New)
 							Image:   fmt.Sprintf("%s:%s", image.Repository, image.Tag),
 							Command: []string{"/migration-operator", "entry"},
 							VolumeMounts: []corev1.VolumeMount{{
-								Name:      "new-data",
+								Name:      "data",
 								MountPath: "/data",
 							}},
 						},
 					},
 				},
 			},
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+			// volume claim templates are immutable, these must match
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "new-data",
+					Name: "data",
 				},
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
