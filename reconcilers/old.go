@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	migrationv1alpha1 "github.com/andrewstucki/migration-experiment/apis/migration/v1alpha1"
+	migrationkube "github.com/andrewstucki/migration-experiment/kube"
 	"github.com/andrewstucki/migration-experiment/render"
 )
 
@@ -18,8 +19,9 @@ type OldReconciler struct {
 	ctl           *kube.Ctl
 	operator      migrationv1alpha1.Image
 	migrator      render.OldToNewStatefulMigrator
-	manager       *PodManager
-	syncerFactory render.SyncerFactory[migrationv1alpha1.Old, *migrationv1alpha1.Old]
+	manager       *migrationkube.PodManager
+	scaler        *migrationkube.StatefulSetScaler
+	syncerFactory migrationkube.SyncerFactory[migrationv1alpha1.Old, *migrationv1alpha1.Old]
 }
 
 // +kubebuilder:rbac:groups=migration.lambda.coffee,resources=olds,verbs=get;list;watch;create;update;patch;delete
@@ -41,8 +43,8 @@ func (r *OldReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	syncer := r.syncerFactory.Syncer(object)
 
-	var sets appsv1.StatefulSetList
-	err = r.ctl.List(ctx, object.GetNamespace(), &sets, client.MatchingLabels(render.OldOwnershipLabels(object)))
+	var existingSets appsv1.StatefulSetList
+	err = r.ctl.List(ctx, object.GetNamespace(), &existingSets, client.MatchingLabels(render.OldOwnershipLabels(object)))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -53,7 +55,7 @@ func (r *OldReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				return ctrl.Result{}, err
 			}
 
-			for _, set := range sets.Items {
+			for _, set := range existingSets.Items {
 				if err := r.ctl.Delete(ctx, &set); err != nil {
 					return ctrl.Result{}, err
 				}
@@ -67,6 +69,11 @@ func (r *OldReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			}
 		}
 		return ctrl.Result{}, nil
+	}
+
+	existing, err := kube.Items[*appsv1.StatefulSet](&existingSets)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if controllerutil.AddFinalizer(object, Finalizer) {
@@ -86,7 +93,7 @@ func (r *OldReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	// ensure we're all up-to-date
-	for _, set := range sets.Items {
+	for _, set := range existingSets.Items {
 		outdated, err := r.manager.GetNextOutdatedPod(ctx, &set)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -104,12 +111,22 @@ func (r *OldReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 	}
 
-	desired := render.OldStatefulSet(r.operator, object)
-	if err := controllerutil.SetControllerReference(object, desired, r.ctl.Scheme()); err != nil {
+	desired := render.OldStatefulSets(r.operator, object)
+	for _, set := range desired {
+		if err := controllerutil.SetControllerReference(object, set, r.ctl.Scheme()); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.ctl.Apply(ctx, set, client.ForceOwnership); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	scaledDown, err := r.scaler.ScaleDownFirstUndesired(ctx, existing, desired)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.ctl.Apply(ctx, desired, client.ForceOwnership); err != nil {
-		return ctrl.Result{}, err
+	if scaledDown != nil {
+		logger.Info("scaled down set", "set", scaledDown.Name)
 	}
 
 	return ctrl.Result{}, nil
@@ -135,5 +152,5 @@ func SetupOldReconciler(operator migrationv1alpha1.Image, mgr ctrl.Manager) erro
 
 	maybeWatchResources(ctl.Scheme(), ctl.RESTMapper(), builder, render.OldRenderedTypes(), render.OldNameLabelKey, render.OldNamespaceLabelKey)
 
-	return builder.Complete(&OldReconciler{operator: operator, ctl: ctl, syncerFactory: render.OldSyncerFactoryForKubeCtl(ctl), migrator: render.NewOldToNewStatefulMigrator(ctl), manager: NewPodManager(ctl)})
+	return builder.Complete(&OldReconciler{operator: operator, ctl: ctl, syncerFactory: render.OldSyncerFactoryForKubeCtl(ctl), migrator: render.NewOldToNewStatefulMigrator(ctl), manager: migrationkube.NewPodManager(ctl), scaler: migrationkube.NewStatefulSetScaler(ctl)})
 }

@@ -1,4 +1,4 @@
-package render
+package kube
 
 import (
 	"context"
@@ -19,6 +19,47 @@ import (
 
 // TODO: extract to kube package
 
+const (
+	MigrationStatusMigrating = "migrating"
+	MigrationStatusMigrated  = "migrated"
+)
+
+type MigrationLabels[T any, U any, PT PObject[T], PU PObject[U]] struct {
+	StatusLabel    string
+	SourceLabel    string
+	TargetLabel    string
+	MigratingLabel string
+}
+
+type Syncer interface {
+	DeleteAll(ctx context.Context) (bool, error)
+	Sync(ctx context.Context) ([]client.Object, error)
+	ListInPurview(ctx context.Context) ([]client.Object, error)
+	OwnerLabels() map[string]string
+}
+
+type SyncerFactory[T any, PT PObject[T]] interface {
+	Syncer(state PT) Syncer
+}
+
+type StatefulMigrator[T any, U any, PT PObject[T], PU PObject[U]] interface {
+	EnsureMigrated(context.Context, PU) error
+	ClearMigrationMarker(context.Context, *appsv1.StatefulSet) (bool, error)
+	ShouldMigrateSource(PT) bool
+}
+
+type Migrator[T any, U any, PT PObject[T], PU PObject[U]] interface {
+	SourceFromTarget(PU) *types.NamespacedName
+	MarkMigrated(PT)
+	IsMigrated(PT) bool
+	IsMigrating(PT) bool
+}
+
+type PObject[T any] interface {
+	client.Object
+	*T
+}
+
 var (
 	ErrMigrationSourceNotFound  = errors.New("migration source not found")
 	ErrUnmatchedMigrationTarget = errors.New("migration target and source both require migration labels")
@@ -29,28 +70,15 @@ func ptrFor[T any, PT PObject[T]]() PT {
 	return &v
 }
 
-type StatefulMigrator[T any, U any, PT PObject[T], PU PObject[U]] interface {
-	EnsureMigrated(context.Context, PU) (PT, error)
-	ShouldMigrateSource(PT) bool
-	ShouldMigrateTarget(PU) bool
-}
-
-type Migrator[T any, U any, PT PObject[T], PU PObject[U]] interface {
-	SourceFromTarget(PU) *types.NamespacedName
-	MarkMigrated(PT)
-	IsMigrated(PT) bool
-	IsMigrating(PT) bool
-}
-
 func NewStatefulMigrator[T any, U any, PT PObject[T], PU PObject[U]](
 	ctl *kube.Ctl,
-	migrator Migrator[T, U, PT, PU],
+	labels MigrationLabels[T, U, PT, PU],
 	sourceSyncerFactory SyncerFactory[T, PT],
 	targetSyncerFactory SyncerFactory[U, PU],
 ) StatefulMigrator[T, U, PT, PU] {
 	return &statefulMigrator[T, U, PT, PU]{
 		ctl:                 ctl,
-		migrator:            migrator,
+		labels:              labels,
 		sourceSyncerFactory: sourceSyncerFactory,
 		targetSyncerFactory: targetSyncerFactory,
 	}
@@ -58,67 +86,69 @@ func NewStatefulMigrator[T any, U any, PT PObject[T], PU PObject[U]](
 
 type statefulMigrator[T any, U any, PT PObject[T], PU PObject[U]] struct {
 	ctl                 *kube.Ctl
-	migrator            Migrator[T, U, PT, PU]
+	labels              MigrationLabels[T, U, PT, PU]
 	sourceSyncerFactory SyncerFactory[T, PT]
 	targetSyncerFactory SyncerFactory[U, PU]
 }
 
 func (m *statefulMigrator[T, U, PT, PU]) getMigrationSource(ctx context.Context, target PU) (PT, error) {
-	if namespacedName := m.migrator.SourceFromTarget(target); namespacedName != nil {
-		source := ptrFor[T, PT]()
-		err := m.ctl.Get(ctx, *namespacedName, source)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		return source, nil
+	sourceLabel := getLabel(m.labels.SourceLabel, target)
+	if sourceLabel == "" {
+		return nil, nil
 	}
-	return nil, nil
+
+	source := ptrFor[T, PT]()
+	err := m.ctl.Get(ctx, types.NamespacedName{Namespace: target.GetNamespace(), Name: sourceLabel}, source)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return source, nil
 }
 
-func (m *statefulMigrator[T, U, PT, PU]) EnsureMigrated(ctx context.Context, target PU) (PT, error) {
+func (m *statefulMigrator[T, U, PT, PU]) EnsureMigrated(ctx context.Context, target PU) error {
 	source, err := m.getMigrationSource(ctx, target)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// if we can't find a source either error or no-op depending on whether or not this target should be migrated
 	if source == nil {
-		if m.ShouldMigrateTarget(target) {
-			return nil, ErrMigrationSourceNotFound
+		if m.shouldMigrateTarget(target) {
+			return ErrMigrationSourceNotFound
 		}
-		return nil, nil
+		return nil
 	}
 
 	// at this point we know we have a source, so check to make sure we're supposed to be migrating it
-	if !m.ShouldMigrateSource(source) {
-		return nil, ErrUnmatchedMigrationTarget
+	if !m.ShouldMigrateSource(source) || !m.targetMatches(source, target) {
+		return ErrUnmatchedMigrationTarget
 	}
 
 	// if the source is already marked as migrated, we can skip everything else
-	if m.migrator.IsMigrated(source) {
-		return source, nil
+	if m.isMigrated(source) {
+		return nil
 	}
 
 	targetSyncer := m.targetSyncerFactory.Syncer(target)
 	targetRendered, err := targetSyncer.Sync(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	remainder, err := m.findRemainder(ctx, source, targetRendered)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := m.adoptStatefulSets(ctx, source, target); err != nil {
-		return nil, err
+		return err
 	}
 
 	migrated, err := m.checkMigrated(ctx, source, target)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if migrated {
@@ -128,30 +158,16 @@ func (m *statefulMigrator[T, U, PT, PU]) EnsureMigrated(ctx context.Context, tar
 				if apierrors.IsNotFound(err) {
 					continue
 				}
-				return nil, err
+				return err
 			}
 		}
 
-		if err := retry.RetryOnConflict(wait.Backoff{
-			Duration: 10 * time.Millisecond,
-			Factor:   1.5,
-			Jitter:   0.1,
-			Steps:    3,
-		}, func() error {
-			if err := m.ctl.Get(ctx, client.ObjectKeyFromObject(source), source); err != nil {
-				return err
-			}
-
-			// mark the source as migrated
-			m.migrator.MarkMigrated(source)
-			// and update to ensure we've persisted the migration marker
-			return m.ctl.Update(ctx, source)
-		}); err != nil {
-			return nil, err
+		if err := m.markMigrated(ctx, source); err != nil {
+			return err
 		}
 	}
 
-	return source, nil
+	return nil
 }
 
 func (m *statefulMigrator[T, U, PT, PU]) adoptStatefulSets(ctx context.Context, source PT, target PU) error {
@@ -191,6 +207,7 @@ func (m *statefulMigrator[T, U, PT, PU]) updateStatefulSet(ctx context.Context, 
 
 	maps.DeleteFunc(labels, func(k, v string) bool { return sourceLabels[k] == v })
 	maps.Copy(labels, targetLabels)
+	labels[m.labels.MigratingLabel] = time.Now().UTC().Format("20060102T150405Z")
 	set.SetLabels(labels)
 
 	if err := controllerutil.RemoveControllerReference(source, set, m.ctl.Scheme()); err != nil {
@@ -265,7 +282,7 @@ func (m *statefulMigrator[T, U, PT, PU]) checkMigrated(ctx context.Context, sour
 
 	// ensure all target statefulsets are updated
 	for _, set := range targetSets.Items {
-		updated := set.Status.ObservedGeneration == set.Generation && set.Status.UpdatedReplicas == set.Status.Replicas
+		updated := set.Status.ObservedGeneration == set.Generation && set.Status.UpdatedReplicas == set.Status.Replicas && !m.isSetMigrating(ctx, &set)
 		if !updated {
 			return false, nil
 		}
@@ -275,9 +292,89 @@ func (m *statefulMigrator[T, U, PT, PU]) checkMigrated(ctx context.Context, sour
 }
 
 func (m *statefulMigrator[T, U, PT, PU]) ShouldMigrateSource(source PT) bool {
-	return m.migrator.IsMigrating(source) || m.migrator.IsMigrated(source)
+	return getLabel(m.labels.TargetLabel, source) != ""
 }
 
-func (m *statefulMigrator[T, U, PT, PU]) ShouldMigrateTarget(target PU) bool {
-	return m.migrator.SourceFromTarget(target) != nil
+func (m *statefulMigrator[T, U, PT, PU]) ClearMigrationMarker(ctx context.Context, set *appsv1.StatefulSet) (bool, error) {
+	labels := set.GetLabels()
+	if labels == nil {
+		return false, nil
+	}
+	if _, ok := labels[m.labels.MigratingLabel]; !ok {
+		return false, nil
+	}
+
+	return true, retryUpdate(ctx, m.ctl, client.ObjectKeyFromObject(set), func(obj *appsv1.StatefulSet) {
+		labels := obj.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		delete(labels, m.labels.MigratingLabel)
+		obj.SetLabels(labels)
+	})
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) markMigrated(ctx context.Context, source PT) error {
+	return m.markSource(ctx, source.DeepCopyObject().(PT), MigrationStatusMigrated)
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) markMigrating(ctx context.Context, source PT) error {
+	return m.markSource(ctx, source.DeepCopyObject().(PT), MigrationStatusMigrating)
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) markSource(ctx context.Context, source PT, status string) error {
+	return retryUpdate(ctx, m.ctl, client.ObjectKeyFromObject(source), func(o PT) {
+		labels := o.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels[m.labels.StatusLabel] = status
+		o.SetLabels(labels)
+	})
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) isSetMigrating(ctx context.Context, set *appsv1.StatefulSet) bool {
+	return getLabel(m.labels.MigratingLabel, set) != ""
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) isMigrated(source PT) bool {
+	return getLabel(m.labels.StatusLabel, source) == MigrationStatusMigrated
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) isMigrating(source PT) bool {
+	return getLabel(m.labels.StatusLabel, source) == MigrationStatusMigrating
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) shouldMigrateTarget(target PU) bool {
+	return getLabel(m.labels.SourceLabel, target) != ""
+}
+
+func (m *statefulMigrator[T, U, PT, PU]) targetMatches(source PT, target PU) bool {
+	return getLabel(m.labels.TargetLabel, source) == target.GetName()
+}
+
+func getLabel(key string, obj client.Object) string {
+	labels := obj.GetLabels()
+	if labels == nil {
+		return ""
+	}
+	return labels[key]
+}
+
+func retryUpdate[T any, PT PObject[T]](ctx context.Context, ctl *kube.Ctl, key types.NamespacedName, updateFunc func(o PT)) error {
+	return retry.RetryOnConflict(wait.Backoff{
+		Duration: 10 * time.Millisecond,
+		Factor:   1.5,
+		Jitter:   0.1,
+		Steps:    3,
+	}, func() error {
+		obj := ptrFor[T, PT]()
+		if err := ctl.Get(ctx, key, obj); err != nil {
+			return err
+		}
+
+		updateFunc(obj)
+
+		return ctl.Update(ctx, obj)
+	})
 }

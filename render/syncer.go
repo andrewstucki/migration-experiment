@@ -4,32 +4,17 @@ import (
 	"context"
 	"slices"
 
+	"github.com/redpanda-data/common-go/kube"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	migrationv1alpha1 "github.com/andrewstucki/migration-experiment/apis/migration/v1alpha1"
-	"github.com/redpanda-data/common-go/kube"
+	migrationkube "github.com/andrewstucki/migration-experiment/kube"
 )
 
-type PObject[T any] interface {
-	client.Object
-	*T
-}
-
-type Syncer interface {
-	DeleteAll(ctx context.Context) (bool, error)
-	Sync(ctx context.Context) ([]client.Object, error)
-	ListInPurview(ctx context.Context) ([]client.Object, error)
-	OwnerLabels() map[string]string
-}
-
-type SyncerFactory[T any, PT PObject[T]] interface {
-	Syncer(state PT) Syncer
-}
-
-func NewSyncerFactoryForKubeCtl(ctl *kube.Ctl) SyncerFactory[migrationv1alpha1.New, *migrationv1alpha1.New] {
+func NewSyncerFactoryForKubeCtl(ctl *kube.Ctl) migrationkube.SyncerFactory[migrationv1alpha1.New, *migrationv1alpha1.New] {
 	return &kubeCtlSyncerFactory[migrationv1alpha1.New, *migrationv1alpha1.New]{
 		ctl:       ctl,
 		renderer:  RenderNew,
@@ -38,7 +23,7 @@ func NewSyncerFactoryForKubeCtl(ctl *kube.Ctl) SyncerFactory[migrationv1alpha1.N
 	}
 }
 
-func OldSyncerFactoryForKubeCtl(ctl *kube.Ctl) SyncerFactory[migrationv1alpha1.Old, *migrationv1alpha1.Old] {
+func OldSyncerFactoryForKubeCtl(ctl *kube.Ctl) migrationkube.SyncerFactory[migrationv1alpha1.Old, *migrationv1alpha1.Old] {
 	return &kubeCtlSyncerFactory[migrationv1alpha1.Old, *migrationv1alpha1.Old]{
 		ctl:       ctl,
 		renderer:  RenderOld,
@@ -47,14 +32,14 @@ func OldSyncerFactoryForKubeCtl(ctl *kube.Ctl) SyncerFactory[migrationv1alpha1.O
 	}
 }
 
-type kubeCtlSyncerFactory[T any, PT PObject[T]] struct {
+type kubeCtlSyncerFactory[T any, PT migrationkube.PObject[T]] struct {
 	renderer  func(context.Context, PT) ([]kube.Object, error)
 	types     func() []kube.Object
 	ownership func(o PT) map[string]string
 	ctl       *kube.Ctl
 }
 
-func (f *kubeCtlSyncerFactory[T, PT]) Syncer(state PT) Syncer {
+func (f *kubeCtlSyncerFactory[T, PT]) Syncer(state PT) migrationkube.Syncer {
 	return &wrappedSyncer[T, PT]{
 		Syncer: &kube.Syncer{
 			Ctl:       f.ctl,
@@ -74,7 +59,7 @@ func (f *kubeCtlSyncerFactory[T, PT]) Syncer(state PT) Syncer {
 	}
 }
 
-type wrappedSyncer[T any, PT PObject[T]] struct {
+type wrappedSyncer[T any, PT migrationkube.PObject[T]] struct {
 	*kube.Syncer
 	obj PT
 }
@@ -145,13 +130,13 @@ func (s *wrappedSyncer[T, PT]) ListInPurview(ctx context.Context) ([]client.Obje
 	return objects, nil
 }
 
-type renderer[T any, PT PObject[T]] struct {
+type renderer[T any, PT migrationkube.PObject[T]] struct {
 	state    PT
 	renderer func(context.Context, PT) ([]kube.Object, error)
 	types    func() []kube.Object
 }
 
-func newRenderer[T any, PT PObject[T]](
+func newRenderer[T any, PT migrationkube.PObject[T]](
 	renderFn func(context.Context, PT) ([]kube.Object, error),
 	typesFn func() []kube.Object,
 	state PT,

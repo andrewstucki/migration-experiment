@@ -1,4 +1,4 @@
-package render
+package kube
 
 import (
 	"context"
@@ -136,45 +136,22 @@ func setupCRD(t *testing.T, c *kube.Ctl, name string, names apiextensionsv1.Cust
 }
 
 const (
-	testSourceLabel       = "test/migration-source"
-	testStatusLabel       = "test/migration-status"
+	testStatusLabel    = "test/migration-status"
+	testSourceLabel    = "test/migration-source"
+	testTargetLabel    = "test/migration-target"
+	testMigratingLabel = "test/migration-migrating"
+
 	testOldNameLabel      = "test/old-name"
 	testOldNamespaceLabel = "test/old-namespace"
 	testNewNameLabel      = "test/new-name"
 	testNewNamespaceLabel = "test/new-namespace"
 )
 
-type testMigrator struct{}
-
-func (m *testMigrator) SourceFromTarget(target *myKindNew) *types.NamespacedName {
-	labels := target.GetLabels()
-	if labels == nil {
-		return nil
-	}
-	source, ok := labels[testSourceLabel]
-	if !ok {
-		return nil
-	}
-	return &types.NamespacedName{Name: source, Namespace: target.Namespace}
-}
-
-func (m *testMigrator) MarkMigrated(source *myKindOld) {
-	labels := source.GetLabels()
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	labels[testStatusLabel] = "migrated"
-	source.SetLabels(labels)
-}
-
-func (m *testMigrator) IsMigrated(source *myKindOld) bool {
-	labels := source.GetLabels()
-	return labels != nil && labels[testStatusLabel] == "migrated"
-}
-
-func (m *testMigrator) IsMigrating(source *myKindOld) bool {
-	labels := source.GetLabels()
-	return labels != nil && labels[testStatusLabel] == "migrating"
+var testLabels = MigrationLabels[myKindOld, myKindNew, *myKindOld, *myKindNew]{
+	StatusLabel:    testStatusLabel,
+	SourceLabel:    testSourceLabel,
+	TargetLabel:    testTargetLabel,
+	MigratingLabel: testMigratingLabel,
 }
 
 type testSyncer struct {
@@ -314,7 +291,7 @@ func TestStatefulMigrator(t *testing.T) {
 
 	setupCRDs(t, ctl)
 
-	sm := NewStatefulMigrator(ctl, &testMigrator{},
+	sm := NewStatefulMigrator(ctl, testLabels,
 		&testSyncerFactory[myKindOld, *myKindOld]{
 			ownerLabelsFn: func(o *myKindOld) map[string]string {
 				return oldOwnerLabels(o)
@@ -337,8 +314,7 @@ func TestStatefulMigrator(t *testing.T) {
 		}{
 			{"no labels", nil, false},
 			{"unrelated labels", map[string]string{"foo": "bar"}, false},
-			{"migrating", map[string]string{testStatusLabel: "migrating"}, true},
-			{"migrated", map[string]string{testStatusLabel: "migrated"}, true},
+			{"has target label", map[string]string{testTargetLabel: "some-target"}, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
@@ -346,29 +322,6 @@ func TestStatefulMigrator(t *testing.T) {
 				old := &myKindOld{ObjectMeta: metav1.ObjectMeta{Labels: tc.labels}}
 				if got := sm.ShouldMigrateSource(old); got != tc.want {
 					t.Errorf("ShouldMigrateSource() = %v, want %v", got, tc.want)
-				}
-			})
-		}
-	})
-
-	t.Run("ShouldMigrateTarget", func(t *testing.T) {
-		t.Parallel()
-
-		for _, tc := range []struct {
-			name   string
-			labels map[string]string
-			want   bool
-		}{
-			{"no labels", nil, false},
-			{"unrelated labels", map[string]string{"foo": "bar"}, false},
-			{"has source label", map[string]string{testSourceLabel: "some-old"}, true},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-
-				n := &myKindNew{ObjectMeta: metav1.ObjectMeta{Labels: tc.labels}}
-				if got := sm.ShouldMigrateTarget(n); got != tc.want {
-					t.Errorf("ShouldMigrateTarget() = %v, want %v", got, tc.want)
 				}
 			})
 		}
@@ -387,12 +340,8 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			source, err := sm.EnsureMigrated(t.Context(), target)
-			if err != nil {
+			if err := sm.EnsureMigrated(t.Context(), target); err != nil {
 				t.Fatalf("unexpected error: %v", err)
-			}
-			if source != nil {
-				t.Fatal("expected nil source")
 			}
 		})
 
@@ -408,12 +357,8 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			source, err := sm.EnsureMigrated(t.Context(), target)
-			if !errors.Is(err, ErrMigrationSourceNotFound) {
+			if err := sm.EnsureMigrated(t.Context(), target); !errors.Is(err, ErrMigrationSourceNotFound) {
 				t.Fatalf("expected ErrMigrationSourceNotFound, got: %v", err)
-			}
-			if source != nil {
-				t.Fatal("expected nil source")
 			}
 		})
 
@@ -422,6 +367,7 @@ func TestStatefulMigrator(t *testing.T) {
 
 			ns := createNamespace(t, ctl)
 
+			// Source exists but has no target label
 			old := makeOld("source", ns, nil)
 			if err := ctl.Create(t.Context(), old); err != nil {
 				t.Fatal(err)
@@ -434,12 +380,8 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			source, err := sm.EnsureMigrated(t.Context(), target)
-			if !errors.Is(err, ErrUnmatchedMigrationTarget) {
+			if err := sm.EnsureMigrated(t.Context(), target); !errors.Is(err, ErrUnmatchedMigrationTarget) {
 				t.Fatalf("expected ErrUnmatchedMigrationTarget, got: %v", err)
-			}
-			if source != nil {
-				t.Fatal("expected nil source")
 			}
 		})
 
@@ -449,7 +391,8 @@ func TestStatefulMigrator(t *testing.T) {
 			ns := createNamespace(t, ctl)
 
 			old := makeOld("source", ns, map[string]string{
-				testStatusLabel: "migrated",
+				testStatusLabel: MigrationStatusMigrated,
+				testTargetLabel: "target",
 			})
 			if err := ctl.Create(t.Context(), old); err != nil {
 				t.Fatal(err)
@@ -462,26 +405,20 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			source, err := sm.EnsureMigrated(t.Context(), target)
-			if err != nil {
+			if err := sm.EnsureMigrated(t.Context(), target); err != nil {
 				t.Fatalf("unexpected error: %v", err)
-			}
-			if source == nil {
-				t.Fatal("expected non-nil source")
-			}
-			if source.Name != "source" {
-				t.Errorf("expected source name 'source', got %q", source.Name)
 			}
 		})
 
-		t.Run("completes migration", func(t *testing.T) {
+		t.Run("adopts statefulsets", func(t *testing.T) {
 			t.Parallel()
 
 			ctx := t.Context()
 			ns := createNamespace(t, ctl)
 
 			old := makeOld("source", ns, map[string]string{
-				testStatusLabel: "migrating",
+				testStatusLabel: MigrationStatusMigrating,
+				testTargetLabel: "target",
 			})
 			if err := ctl.Create(ctx, old); err != nil {
 				t.Fatal(err)
@@ -502,50 +439,39 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Mark StatefulSet as fully rolled out so checkMigrated succeeds
-			set.Status = appsv1.StatefulSetStatus{
-				ObservedGeneration: set.Generation,
-				Replicas:           3,
-				UpdatedReplicas:    3,
-			}
-			if err := ctl.UpdateStatus(ctx, set); err != nil {
-				t.Fatal(err)
-			}
-
-			source, err := sm.EnsureMigrated(ctx, target)
-			if err != nil {
+			if err := sm.EnsureMigrated(ctx, target); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if source == nil {
-				t.Fatal("expected non-nil source")
-			}
 
-			// Old should now be marked as migrated
+			// Source should NOT be marked as migrated (MigratingLabel prevents completion)
 			updatedOld := &myKindOld{}
 			if err := ctl.Get(ctx, client.ObjectKeyFromObject(old), updatedOld); err != nil {
 				t.Fatal(err)
 			}
-			if updatedOld.Labels[testStatusLabel] != "migrated" {
-				t.Errorf("expected Old status label 'migrated', got labels: %v", updatedOld.Labels)
+			if updatedOld.Labels[testStatusLabel] != MigrationStatusMigrating {
+				t.Errorf("expected source to still be 'migrating', got labels: %v", updatedOld.Labels)
 			}
 
-			// StatefulSet ownership should be transferred to New
+			// StatefulSet ownership should be transferred to target
 			var updatedSet appsv1.StatefulSet
 			if err := ctl.Get(ctx, client.ObjectKeyFromObject(set), &updatedSet); err != nil {
 				t.Fatal(err)
 			}
 
 			if updatedSet.Labels[testNewNameLabel] != target.Name {
-				t.Errorf("expected New name label %q, got %q", target.Name, updatedSet.Labels[testNewNameLabel])
+				t.Errorf("expected new name label %q, got %q", target.Name, updatedSet.Labels[testNewNameLabel])
 			}
 			if updatedSet.Labels[testNewNamespaceLabel] != target.Namespace {
-				t.Errorf("expected New namespace label %q, got %q", target.Namespace, updatedSet.Labels[testNewNamespaceLabel])
+				t.Errorf("expected new namespace label %q, got %q", target.Namespace, updatedSet.Labels[testNewNamespaceLabel])
 			}
 			if _, ok := updatedSet.Labels[testOldNameLabel]; ok {
-				t.Error("expected Old name label to be removed from StatefulSet")
+				t.Error("expected old name label to be removed from StatefulSet")
 			}
 			if _, ok := updatedSet.Labels[testOldNamespaceLabel]; ok {
-				t.Error("expected Old namespace label to be removed from StatefulSet")
+				t.Error("expected old namespace label to be removed from StatefulSet")
+			}
+			if updatedSet.Labels[testMigratingLabel] == "" {
+				t.Error("expected migrating label to be set on StatefulSet")
 			}
 
 			var hasNewRef, hasOldRef bool
@@ -558,10 +484,63 @@ func TestStatefulMigrator(t *testing.T) {
 				}
 			}
 			if !hasNewRef {
-				t.Error("expected StatefulSet to have New as controller owner")
+				t.Error("expected StatefulSet to have target as controller owner")
 			}
 			if hasOldRef {
-				t.Error("expected Old OwnerRef to be removed from StatefulSet")
+				t.Error("expected source owner reference to be removed from StatefulSet")
+			}
+		})
+
+		t.Run("completes migration", func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			ns := createNamespace(t, ctl)
+
+			old := makeOld("source", ns, map[string]string{
+				testStatusLabel: MigrationStatusMigrating,
+				testTargetLabel: "target",
+			})
+			if err := ctl.Create(ctx, old); err != nil {
+				t.Fatal(err)
+			}
+
+			target := makeNew("target", ns, map[string]string{
+				testSourceLabel: "source",
+			})
+			if err := ctl.Create(ctx, target); err != nil {
+				t.Fatal(err)
+			}
+
+			// StatefulSet already adopted: target labels, target owner ref, no MigratingLabel
+			set := makeStatefulSet("test-set", ns, newOwnerLabels(target), 3)
+			if err := controllerutil.SetControllerReference(target, set, ctl.Scheme()); err != nil {
+				t.Fatal(err)
+			}
+			if err := ctl.Create(ctx, set); err != nil {
+				t.Fatal(err)
+			}
+
+			set.Status = appsv1.StatefulSetStatus{
+				ObservedGeneration: set.Generation,
+				Replicas:           3,
+				UpdatedReplicas:    3,
+			}
+			if err := ctl.UpdateStatus(ctx, set); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := sm.EnsureMigrated(ctx, target); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Source should now be marked as migrated
+			updatedOld := &myKindOld{}
+			if err := ctl.Get(ctx, client.ObjectKeyFromObject(old), updatedOld); err != nil {
+				t.Fatal(err)
+			}
+			if updatedOld.Labels[testStatusLabel] != MigrationStatusMigrated {
+				t.Errorf("expected source status label 'migrated', got labels: %v", updatedOld.Labels)
 			}
 		})
 
@@ -572,7 +551,8 @@ func TestStatefulMigrator(t *testing.T) {
 			ns := createNamespace(t, ctl)
 
 			old := makeOld("source", ns, map[string]string{
-				testStatusLabel: "migrating",
+				testStatusLabel: MigrationStatusMigrating,
+				testTargetLabel: "target",
 			})
 			if err := ctl.Create(ctx, old); err != nil {
 				t.Fatal(err)
@@ -585,40 +565,36 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// StatefulSet owned by Old — status left at zero values so
-			// ObservedGeneration(0) != Generation(1) → migration incomplete
-			set := makeStatefulSet("test-set", ns, oldOwnerLabels(old), 3)
-			if err := controllerutil.SetControllerReference(old, set, ctl.Scheme()); err != nil {
+			// StatefulSet adopted but still has MigratingLabel
+			set := makeStatefulSet("test-set", ns, newOwnerLabels(target), 3)
+			set.Labels[testMigratingLabel] = time.Now().UTC().Format("20060102T150405Z")
+			if err := controllerutil.SetControllerReference(target, set, ctl.Scheme()); err != nil {
 				t.Fatal(err)
 			}
 			if err := ctl.Create(ctx, set); err != nil {
 				t.Fatal(err)
 			}
 
-			source, err := sm.EnsureMigrated(ctx, target)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			set.Status = appsv1.StatefulSetStatus{
+				ObservedGeneration: set.Generation,
+				Replicas:           3,
+				UpdatedReplicas:    3,
 			}
-			if source == nil {
-				t.Fatal("expected non-nil source")
+			if err := ctl.UpdateStatus(ctx, set); err != nil {
+				t.Fatal(err)
 			}
 
-			// Old should NOT be marked as migrated yet
+			if err := sm.EnsureMigrated(ctx, target); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Source should NOT be marked as migrated yet
 			updatedOld := &myKindOld{}
 			if err := ctl.Get(ctx, client.ObjectKeyFromObject(old), updatedOld); err != nil {
 				t.Fatal(err)
 			}
-			if updatedOld.Labels[testStatusLabel] != "migrating" {
-				t.Errorf("expected Old to still have 'migrating' label, got labels: %v", updatedOld.Labels)
-			}
-
-			// StatefulSet should still be adopted even though migration not complete
-			var updatedSet appsv1.StatefulSet
-			if err := ctl.Get(ctx, client.ObjectKeyFromObject(set), &updatedSet); err != nil {
-				t.Fatal(err)
-			}
-			if updatedSet.Labels[testNewNameLabel] != target.Name {
-				t.Errorf("expected StatefulSet to have New name label after adoption, got labels: %v", updatedSet.Labels)
+			if updatedOld.Labels[testStatusLabel] != MigrationStatusMigrating {
+				t.Errorf("expected source to still have 'migrating' label, got labels: %v", updatedOld.Labels)
 			}
 		})
 
@@ -629,7 +605,8 @@ func TestStatefulMigrator(t *testing.T) {
 			ns := createNamespace(t, ctl)
 
 			old := makeOld("source", ns, map[string]string{
-				testStatusLabel: "migrating",
+				testStatusLabel: MigrationStatusMigrating,
+				testTargetLabel: "target",
 			})
 			if err := ctl.Create(ctx, old); err != nil {
 				t.Fatal(err)
@@ -642,9 +619,10 @@ func TestStatefulMigrator(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			// Multiple pre-adopted StatefulSets, all rolled out
 			for _, name := range []string{"set-a", "set-b"} {
-				set := makeStatefulSet(name, ns, oldOwnerLabels(old), 3)
-				if err := controllerutil.SetControllerReference(old, set, ctl.Scheme()); err != nil {
+				set := makeStatefulSet(name, ns, newOwnerLabels(target), 3)
+				if err := controllerutil.SetControllerReference(target, set, ctl.Scheme()); err != nil {
 					t.Fatal(err)
 				}
 				if err := ctl.Create(ctx, set); err != nil {
@@ -660,33 +638,72 @@ func TestStatefulMigrator(t *testing.T) {
 				}
 			}
 
-			source, err := sm.EnsureMigrated(ctx, target)
-			if err != nil {
+			if err := sm.EnsureMigrated(ctx, target); err != nil {
 				t.Fatalf("unexpected error: %v", err)
-			}
-			if source == nil {
-				t.Fatal("expected non-nil source")
-			}
-
-			for _, name := range []string{"set-a", "set-b"} {
-				var set appsv1.StatefulSet
-				if err := ctl.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &set); err != nil {
-					t.Fatalf("getting %s: %v", name, err)
-				}
-				if set.Labels[testNewNameLabel] != target.Name {
-					t.Errorf("%s: expected New name label, got labels: %v", name, set.Labels)
-				}
-				if _, ok := set.Labels[testOldNameLabel]; ok {
-					t.Errorf("%s: expected Old name label removed", name)
-				}
 			}
 
 			updatedOld := &myKindOld{}
 			if err := ctl.Get(ctx, client.ObjectKeyFromObject(old), updatedOld); err != nil {
 				t.Fatal(err)
 			}
-			if updatedOld.Labels[testStatusLabel] != "migrated" {
-				t.Errorf("expected Old status 'migrated', got labels: %v", updatedOld.Labels)
+			if updatedOld.Labels[testStatusLabel] != MigrationStatusMigrated {
+				t.Errorf("expected source status 'migrated', got labels: %v", updatedOld.Labels)
+			}
+		})
+	})
+
+	t.Run("ClearMigrationMarker", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("no marker", func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			ns := createNamespace(t, ctl)
+
+			set := makeStatefulSet("test-set", ns, map[string]string{"app": "test"}, 1)
+			if err := ctl.Create(ctx, set); err != nil {
+				t.Fatal(err)
+			}
+
+			cleared, err := sm.ClearMigrationMarker(ctx, set)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cleared {
+				t.Error("expected cleared to be false")
+			}
+		})
+
+		t.Run("clears marker", func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			ns := createNamespace(t, ctl)
+
+			set := makeStatefulSet("test-set", ns, map[string]string{
+				"app":              "test",
+				testMigratingLabel: time.Now().UTC().Format("20060102T150405Z"),
+			}, 1)
+			if err := ctl.Create(ctx, set); err != nil {
+				t.Fatal(err)
+			}
+
+			cleared, err := sm.ClearMigrationMarker(ctx, set)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !cleared {
+				t.Error("expected cleared to be true")
+			}
+
+			// Verify label was removed from the server
+			var updatedSet appsv1.StatefulSet
+			if err := ctl.Get(ctx, client.ObjectKeyFromObject(set), &updatedSet); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := updatedSet.Labels[testMigratingLabel]; ok {
+				t.Error("expected migrating label to be removed")
 			}
 		})
 	})
