@@ -25,6 +25,20 @@ func NewPodManager(ctl *kube.Ctl) *PodManager {
 	return &PodManager{ctl: ctl}
 }
 
+func (m *PodManager) AllPodsStable(ctx context.Context, sets []*appsv1.StatefulSet) (bool, error) {
+	for _, set := range sets {
+		stable, err := m.PodsStable(ctx, set)
+		if err != nil {
+			return false, err
+		}
+		if !stable {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
 func (m *PodManager) PodsStable(ctx context.Context, set *appsv1.StatefulSet) (bool, error) {
 	pods, err := m.getPods(ctx, set)
 	if err != nil {
@@ -89,7 +103,18 @@ func (m *PodManager) getPods(ctx context.Context, set *appsv1.StatefulSet) ([]*c
 	if err != nil {
 		return nil, err
 	}
-	return sortPodsByOrdinal(pods...)
+
+	// filter to only pods owned by this StatefulSet, since multiple
+	// StatefulSets may share the same selector during migration
+	owned := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		ref := metav1.GetControllerOfNoCopy(pod)
+		if ref != nil && ref.UID == set.GetUID() {
+			owned = append(owned, pod)
+		}
+	}
+
+	return sortPodsByOrdinal(owned...)
 }
 
 func (m *PodManager) GetStatefulSetRevisions(ctx context.Context, set *appsv1.StatefulSet) ([]*appsv1.ControllerRevision, error) {

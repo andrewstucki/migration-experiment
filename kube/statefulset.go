@@ -39,6 +39,12 @@ func (s *StatefulSetScaler) scaleDownStatefulSet(ctx context.Context, set *appsv
 		return true, s.ctl.Delete(ctx, set)
 	}
 
+	// wait for the previous scale-down to fully complete before
+	// decrementing further, otherwise all pods terminate at once
+	if set.Status.ObservedGeneration != set.Generation || set.Status.Replicas != ptr.Deref(set.Spec.Replicas, 1) {
+		return false, nil
+	}
+
 	return false, retryUpdate(ctx, s.ctl, client.ObjectKeyFromObject(set), func(obj *appsv1.StatefulSet) {
 		obj.Spec.Replicas = ptr.To(ptr.Deref(obj.Spec.Replicas, 1) - 1)
 	})

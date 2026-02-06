@@ -97,25 +97,6 @@ func (r *NewReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// ensure we're all up-to-date
-	for _, set := range existingSets.Items {
-		outdated, err := r.manager.GetNextOutdatedPod(ctx, &set)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		stable, err := r.manager.PodsStable(ctx, &set)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if outdated != nil && stable {
-			logger.Info("found outdated pod, rolling", "pod", outdated.Name)
-			if err := r.ctl.Delete(ctx, outdated); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{Requeue: true}, nil
-		}
-	}
-
 	desired := render.NewStatefulSets(r.operator, object)
 	for _, set := range desired {
 		if err := controllerutil.SetControllerReference(object, set, r.ctl.Scheme()); err != nil {
@@ -133,12 +114,34 @@ func (r *NewReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 	}
 
-	scaledDown, err := r.scaler.ScaleDownFirstUndesired(ctx, existing, desired)
+	// ensure we're all up-to-date
+	stable, err := r.manager.AllPodsStable(ctx, append(existing, desired...))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if scaledDown != nil {
-		logger.Info("scaled down set", "set", scaledDown.Name)
+
+	for _, set := range existing {
+		outdated, err := r.manager.GetNextOutdatedPod(ctx, set)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if outdated != nil && stable {
+			logger.Info("found outdated pod, rolling", "pod", outdated.Name)
+			if err := r.ctl.Delete(ctx, outdated); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
+	if stable {
+		scaledDown, err := r.scaler.ScaleDownFirstUndesired(ctx, existing, desired)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if scaledDown != nil {
+			logger.Info("scaled down set", "set", scaledDown.Name)
+		}
 	}
 
 	return ctrl.Result{}, nil

@@ -55,7 +55,7 @@ func OldStatefulSets(image migrationv1alpha1.Image, state *migrationv1alpha1.Old
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
-				MatchLabels: statefulsetSelectorLabels("set"),
+				MatchLabels: mergeLabels(OldOwnershipLabels(state), statefulsetSelectorLabels("set")),
 			},
 			Replicas: state.Spec.Replicas,
 			Template: corev1.PodTemplateSpec{
@@ -79,7 +79,6 @@ func OldStatefulSets(image migrationv1alpha1.Image, state *migrationv1alpha1.Old
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.OnDeleteStatefulSetStrategyType,
 			},
-			// volume claim templates are immutable, these must match
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "old-data",

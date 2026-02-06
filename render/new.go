@@ -45,8 +45,7 @@ func NewStatefulSets(image migrationv1alpha1.Image, state *migrationv1alpha1.New
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
-				// this also needs to be identical to the old selector
-				MatchLabels: statefulsetSelectorLabels("set"),
+				MatchLabels: mergeLabels(NewOwnershipLabels(state), statefulsetSelectorLabels("set")),
 			},
 			Replicas: state.Spec.Replicas,
 			Template: corev1.PodTemplateSpec{
